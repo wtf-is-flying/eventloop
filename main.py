@@ -38,19 +38,23 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Generator, Coroutine
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import coroutine
 from typing import Any
 
 
+class Pending: ...
+
+
+@dataclass
+class Finished:
+    value: Any
+
+
+@dataclass
 class Task:
     coroutine: Coroutine[YieldType, Any, Any]
-    result: Any = None
-    exception: Exception | None = None
-    cancelled: bool = False
-
-    def __init__(self, coroutine: Coroutine[YieldType, Any, Any]) -> None:
-        self.coroutine = coroutine
+    state: Pending | Finished = field(default_factory=Pending)
 
 
 @dataclass
@@ -68,15 +72,16 @@ class Join(EventLoopRequest[None]):
 
 
 @dataclass
-class Nothing(EventLoopRequest[None]): ...
+class Nothing(EventLoopRequest[None]):
+    id: str
 
 
 YieldType = Spawn | Join | Nothing
 
 
 @coroutine
-def nothing():
-    yield Nothing()
+def nothing(id: str = "unknown"):
+    yield Nothing(id)
 
 
 @coroutine
@@ -95,18 +100,28 @@ def join(task: Task) -> Generator[Join, None, None]:
 
 
 async def hello(name: str):
-    await nothing()
+    await nothing("hello")
     print(f"Hello, {name}!")
 
 
 async def main():
     # Recover the child task handle.
-    child = await spawn(hello("world"))
+    alice = await spawn(hello("Alice"))
+    _ = await spawn(hello("Bob"))
+
+    # Dummy event loop steps
+    await nothing("main 1")
+    await nothing("main 2")
+    await nothing("main 3")
+    await nothing("main 4")
+    await nothing("main 5")
 
     # Wait for the child task to complete.
-    await join(child)
+    await join(alice)
+    print("after alice")
 
-    print("(after join)")
+    await hello("Carl")
+    print("after bob")
 
 
 SendType = Any
@@ -121,13 +136,13 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
         task, data = task_queue.pop(0)
 
         try:
-            # Send back data to the coroutine,
-            # and go the next 'yieldpoint' = await of task
+            # Send back data to the coroutine, resuming it
+            # and go the next 'yieldpoint' = await of coroutine
             yielded = task.coroutine.send(data)
 
         except StopIteration as exc:
             # Last yieldpoint of task reached
-            task.result = exc.value
+            task.state = Finished(value=exc.value)
 
             # Reschedule tasks waiting on this task
             task_queue.extend((t, None) for t in watched_by.pop(task, []))
@@ -144,8 +159,16 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
                     # Add the new child task to queue
                     task_queue.append((child, None))
 
-                case Join(other_task):
-                    watched_by[other_task].append(task)
+                case Join(child):
+                    match child.state:
+                        case Pending():
+                            # Child task is currently in queue
+                            watched_by[child].append(task)
+                        case Finished(value):
+                            # Child task finished.
+                            # Resume the parent task immediately
+                            # with the result from child
+                            task_queue.insert(0, (task, value))
 
                 case Nothing():
                     # Debug request, continue parent
