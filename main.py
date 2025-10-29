@@ -39,8 +39,15 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Generator, Coroutine
 from dataclasses import dataclass, field
+import heapq
+import time
 from types import coroutine
 from typing import Any
+
+
+# def clock() -> float: ...
+
+clock = time.time
 
 
 class Pending: ...
@@ -58,30 +65,33 @@ class Task:
 
 
 @dataclass
-class EventLoopRequest[T]: ...
+class EventLoopRequest: ...
 
 
 @dataclass
-class Spawn(EventLoopRequest[Task]):
+class Spawn(EventLoopRequest):
     coroutine: Coroutine[Any, Any, Any]
 
 
 @dataclass
-class Join(EventLoopRequest[None]):
+class Join(EventLoopRequest):
     task: Task
 
 
 @dataclass
-class Nothing(EventLoopRequest[None]):
+class Sleep(EventLoopRequest):
+    delay: float
+
+
+@dataclass
+
+
+@dataclass
+class Nothing(EventLoopRequest):
     id: str
 
 
-YieldType = Spawn | Join | Nothing
-
-
-@coroutine
-def nothing(id: str = "unknown"):
-    yield Nothing(id)
+YieldType = Spawn | Join | Sleep | Nothing
 
 
 @coroutine
@@ -99,15 +109,29 @@ def join(task: Task) -> Generator[Join, None, None]:
     yield Join(task)
 
 
+@coroutine
+def nothing(id: str = "unknown"):
+    yield Nothing(id)
+
+
+@coroutine
+def sleep(delay: float) -> Generator[Sleep, None, None]:
+    yield Sleep(delay=delay)
+
+
 async def hello(name: str):
     await nothing("hello")
     print(f"Hello, {name}!")
 
 
+async def hello_delayed(name: str, delay: float):
+    await sleep(delay)
+    print(f"H-H-H-Hello, {name}!")
+
+
 async def main():
     # Recover the child task handle.
     alice = await spawn(hello("Alice"))
-    _ = await spawn(hello("Bob"))
 
     # Dummy event loop steps
     await nothing("main 1")
@@ -115,6 +139,13 @@ async def main():
     await nothing("main 3")
     await nothing("main 4")
     await nothing("main 5")
+
+    # Test sleep
+    start = clock()
+    _ = await spawn(hello_delayed("Bob", 2))
+    await sleep(3)
+    duration = clock() - start
+    print(f"Slept for {duration} s")
 
     # Wait for the child task to complete.
     await join(alice)
@@ -127,52 +158,79 @@ async def main():
 SendType = Any
 
 
+@dataclass(order=True)
+class SleepingTask:
+    task: Task = field(compare=False)
+    resume_at: float
+
+
 def run_until_complete(main: Coroutine[Any, Any, Any]):
     task_queue: list[tuple[Task, SendType]] = [(Task(main), None)]
 
     watched_by: defaultdict[Task, list[Task]] = defaultdict(list)
+    sleeping_tasks: list[SleepingTask] = []
 
-    while len(task_queue) > 0:
-        task, data = task_queue.pop(0)
+    while True:
+        # If no task is pending, don't loop
+        if not task_queue:
+            time.sleep(max(0, sleeping_tasks[0].resume_at - clock()))
 
-        try:
-            # Send back data to the coroutine, resuming it
-            # and go the next 'yieldpoint' = await of coroutine
-            yielded = task.coroutine.send(data)
+        # Schedule tasks that have their sleep delay elapsed
+        while sleeping_tasks and sleeping_tasks[0].resume_at < clock():
+            st = heapq.heappop(sleeping_tasks)
+            task_queue.append((st.task, None))
 
-        except StopIteration as exc:
-            # Last yieldpoint of task reached
-            task.state = Finished(value=exc.value)
+        # Run all tasks
+        while task_queue:
+            task, data = task_queue.pop(0)
 
-            # Reschedule tasks waiting on this task
-            task_queue.extend((t, None) for t in watched_by.pop(task, []))
+            try:
+                # Send back data to the coroutine, resuming it
+                # and go the next 'yieldpoint' = await of coroutine
+                yielded = task.coroutine.send(data)
 
-        else:
-            match yielded:
-                case Spawn(coroutine):
-                    child = Task(coroutine)
-                    # Resume task which requested a spawn.
-                    # It will send back `child` to the parent
-                    # on the next iteration (insert at 0).
-                    task_queue.insert(0, (task, child))
+            except StopIteration as exc:
+                # Last yieldpoint of task reached
+                task.state = Finished(value=exc.value)
 
-                    # Add the new child task to queue
-                    task_queue.append((child, None))
+                # Reschedule tasks waiting on this task
+                task_queue.extend((t, None) for t in watched_by.pop(task, []))
 
-                case Join(child):
-                    match child.state:
-                        case Pending():
-                            # Child task is currently in queue
-                            watched_by[child].append(task)
-                        case Finished(value):
-                            # Child task finished.
-                            # Resume the parent task immediately
-                            # with the result from child
-                            task_queue.insert(0, (task, value))
+            else:
+                match yielded:
+                    case Spawn(coroutine):
+                        child = Task(coroutine)
+                        # Resume task which requested a spawn.
+                        # It will send back `child` to the parent
+                        # on the next iteration (insert at 0).
+                        task_queue.insert(0, (task, child))
 
-                case Nothing():
-                    # Debug request, continue parent
-                    task_queue.append((task, None))
+                        # Add the new child task to queue
+                        task_queue.append((child, None))
+
+                    case Join(child):
+                        match child.state:
+                            case Pending():
+                                # Child task is currently in queue
+                                watched_by[child].append(task)
+                            case Finished(value):
+                                # Child task finished.
+                                # Resume the parent task immediately
+                                # with the result from child
+                                task_queue.insert(0, (task, value))
+
+                    case Sleep(delay):
+                        heapq.heappush(
+                            sleeping_tasks,
+                            SleepingTask(task=task, resume_at=clock() + delay),
+                        )
+
+                    case Nothing():
+                        # Debug request; continue parent
+                        task_queue.append((task, None))
+
+        if not task_queue and not sleeping_tasks:
+            break
 
 
 run_until_complete(main())
