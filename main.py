@@ -40,21 +40,25 @@ from collections import defaultdict
 from collections.abc import Generator, Coroutine
 from dataclasses import dataclass, field
 import heapq
+import selectors
+import socket
 import time
 from types import coroutine
 from typing import Any
 
 
 # def clock() -> float: ...
-
 clock = time.time
 
 
-class Pending: ...
+class Pending:
+    """Task is pending."""
 
 
 @dataclass
 class Finished:
+    """Task is finished."""
+
     value: Any
 
 
@@ -84,6 +88,13 @@ class Sleep(EventLoopRequest):
 
 
 @dataclass
+class Receive(EventLoopRequest):
+    socket: socket.socket
+
+
+@dataclass
+class Send(EventLoopRequest):
+    socket: socket.socket
 
 
 @dataclass
@@ -91,7 +102,7 @@ class Nothing(EventLoopRequest):
     id: str
 
 
-YieldType = Spawn | Join | Sleep | Nothing
+YieldType = Spawn | Join | Sleep | Send | Receive | Nothing
 
 
 @coroutine
@@ -117,6 +128,29 @@ def nothing(id: str = "unknown"):
 @coroutine
 def sleep(delay: float) -> Generator[Sleep, None, None]:
     yield Sleep(delay=delay)
+
+
+@coroutine
+def socketpair() -> Generator[None, None, tuple[socket.socket, socket.socket]]:
+    lhs, rhs = socket.socketpair()
+    lhs.setblocking(False)
+    rhs.setblocking(False)
+    yield
+    return lhs, rhs
+
+
+@coroutine
+def send(socket: socket.socket, data: bytes):
+    while data:
+        yield Send(socket=socket)
+        size = socket.send(data)
+        data = data[size:]
+
+
+@coroutine
+def recv(socket: socket.socket, size: int):
+    yield Receive(socket=socket)
+    return socket.recv(size)
 
 
 async def hello(name: str):
@@ -165,15 +199,30 @@ class SleepingTask:
 
 
 def run_until_complete(main: Coroutine[Any, Any, Any]):
+    io_selector = selectors.DefaultSelector()
+
     task_queue: list[tuple[Task, SendType]] = [(Task(main), None)]
 
     watched_by: defaultdict[Task, list[Task]] = defaultdict(list)
     sleeping_tasks: list[SleepingTask] = []
 
     while True:
-        # If no task is pending, don't loop
-        if not task_queue:
-            time.sleep(max(0, sleeping_tasks[0].resume_at - clock()))
+        # FIXME: how long should we sleep depending on whether there is no pending task
+        # and/or no sleeping task and/or no watched socket.
+
+        # If no task is pending and we are not watching any socket, don't loop
+        timeout = max(0, sleeping_tasks[0].resume_at - clock())
+        if not task_queue and not io_selector.get_map():
+            time.sleep(timeout)
+
+        # If only no task are pending
+        elif not task_queue:
+            for key, _ in io_selector.select(timeout):
+                # Resume task
+                task_queue.append((key.data, None))
+
+                # Stop watching socket
+                io_selector.unregister(key.fileobj)
 
         # Schedule tasks that have their sleep delay elapsed
         while sleeping_tasks and sleeping_tasks[0].resume_at < clock():
@@ -225,11 +274,17 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
                             SleepingTask(task=task, resume_at=clock() + delay),
                         )
 
+                    case Send(socket):
+                        io_selector.register(socket, selectors.EVENT_WRITE, task)
+
+                    case Receive(socket):
+                        io_selector.register(socket, selectors.EVENT_READ, task)
+
                     case Nothing():
                         # Debug request; continue parent
                         task_queue.append((task, None))
 
-        if not task_queue and not sleeping_tasks:
+        if not task_queue and not sleeping_tasks and not io_selector.get_map():
             break
 
 
