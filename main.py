@@ -39,6 +39,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Generator, Coroutine
 from dataclasses import dataclass, field
+from datetime import timedelta
 import heapq
 import selectors
 import socket
@@ -68,7 +69,14 @@ class Task:
     state: Pending | Finished = field(default_factory=Pending)
 
 
-@dataclass
+## EventLoopRequest -----------------------------------------------------------
+##   EventLoopRequest are types that are sent to the event loop.
+##   They are implementation details of the async runtime.
+##   They allow the runtime to know what to actually do.
+##   User of this 'library' would use the corresponding functions instead.
+## ----------------------------------------------------------------------------
+
+
 class EventLoopRequest: ...
 
 
@@ -77,14 +85,38 @@ class Spawn(EventLoopRequest):
     coroutine: Coroutine[Any, Any, Any]
 
 
+@coroutine
+def spawn(coroutine: Coroutine[Any, Any, Any]) -> Generator[Spawn, Task, Task]:
+    """Spawn a coroutine in the background, returning a handle to it.
+
+    The result can then be obtained using `join`.
+    """
+    handle = yield Spawn(coroutine=coroutine)
+    return handle
+
+
 @dataclass
 class Join(EventLoopRequest):
     task: Task
 
 
+@coroutine
+def join(task: Task) -> Generator[Join, None, None]:
+    """Wait for a task to complete."""
+    # This yield back control to the event loop with a Join request.
+    # The event loop will schedule back the parent task when the child task finishes.
+    yield Join(task)
+
+
 @dataclass
 class Sleep(EventLoopRequest):
-    delay: float
+    delay: timedelta
+
+
+@coroutine
+def sleep(delay: timedelta) -> Generator[Sleep, None, None]:
+    """Sleep for the given delay."""
+    yield Sleep(delay=delay)
 
 
 @dataclass
@@ -92,9 +124,33 @@ class Receive(EventLoopRequest):
     socket: socket.socket
 
 
+@coroutine
+def recv(socket: socket.socket, size: int) -> Generator[Receive, None, bytes]:
+    """Receive data from a socket."""
+    # This yield will return when the socket is ready for read
+    yield Receive(socket=socket)
+
+    # Now, we can read data from the socket
+    return socket.recv(size)
+
+
 @dataclass
 class Send(EventLoopRequest):
     socket: socket.socket
+
+
+@coroutine
+def send(socket: socket.socket, data: bytes) -> Generator[Send, None, None]:
+    """Send data on a socket."""
+    # Loop until all data is sent
+    while data:
+        # This yield will return when the socket is ready for write
+        yield Send(socket=socket)
+
+        # Now, we can write some data to the socket.
+        # `size` is the amount of data written.
+        size = socket.send(data)
+        data = data[size:]
 
 
 @dataclass
@@ -102,32 +158,10 @@ class Nothing(EventLoopRequest):
     id: str
 
 
-YieldType = Spawn | Join | Sleep | Send | Receive | Nothing
-
-
 @coroutine
-def spawn(coroutine: Coroutine[Any, Any, Any]) -> Generator[Spawn, Task, Task]:
-    # NEW: recover the child task handle to pass it back to the parent.
-    handle = yield Spawn(coroutine=coroutine)
-    return handle
-
-
-@coroutine
-def join(task: Task) -> Generator[Join, None, None]:
-    """Awaitable object that sends a request to be notified when a task completes."""
-    # This yield back control to the event loop with a Join request.
-    # The event loop will schedule back the parent task when the child task finishes.
-    yield Join(task)
-
-
-@coroutine
-def nothing(id: str = "unknown"):
+def nothing(id: str = "unknown") -> Generator[Nothing, None, None]:
+    """Do nothing, much like an `await sleep(0)`."""
     yield Nothing(id)
-
-
-@coroutine
-def sleep(delay: float) -> Generator[Sleep, None, None]:
-    yield Sleep(delay=delay)
 
 
 @coroutine
@@ -139,18 +173,9 @@ def socketpair() -> Generator[None, None, tuple[socket.socket, socket.socket]]:
     return lhs, rhs
 
 
-@coroutine
-def send(socket: socket.socket, data: bytes):
-    while data:
-        yield Send(socket=socket)
-        size = socket.send(data)
-        data = data[size:]
-
-
-@coroutine
-def recv(socket: socket.socket, size: int):
-    yield Receive(socket=socket)
-    return socket.recv(size)
+## Example functions ----------------------------------------------------------
+##   Some test functions to showcase how all of this works.
+## ----------------------------------------------------------------------------
 
 
 async def hello(name: str):
@@ -158,7 +183,7 @@ async def hello(name: str):
     print(f"Hello, {name}!")
 
 
-async def hello_delayed(name: str, delay: float):
+async def hello_delayed(name: str, delay: timedelta):
     await sleep(delay)
     print(f"H-H-H-Hello, {name}!")
 
@@ -176,8 +201,8 @@ async def main():
 
     # Test sleep
     start = clock()
-    _ = await spawn(hello_delayed("Bob", 2))
-    await sleep(3)
+    _ = await spawn(hello_delayed("Bob", timedelta(seconds=2)))
+    await sleep(timedelta(seconds=3))
     duration = clock() - start
     print(f"Slept for {duration} s")
 
@@ -189,6 +214,11 @@ async def main():
     print("after bob")
 
 
+## Async 'runtime' ------------------------------------------------------------
+##   The equivalent of `asyncio.run()`.
+## ----------------------------------------------------------------------------
+
+YieldType = Spawn | Join | Sleep | Send | Receive | Nothing
 SendType = Any
 
 
@@ -271,7 +301,9 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
                     case Sleep(delay):
                         heapq.heappush(
                             sleeping_tasks,
-                            SleepingTask(task=task, resume_at=clock() + delay),
+                            SleepingTask(
+                                task=task, resume_at=clock() + delay.total_seconds()
+                            ),
                         )
 
                     case Send(socket):
@@ -288,4 +320,5 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
             break
 
 
-run_until_complete(main())
+if __name__ == "__main__":
+    run_until_complete(main())
