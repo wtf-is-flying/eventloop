@@ -224,6 +224,11 @@ SendType = Any
 
 @dataclass(order=True)
 class SleepingTask:
+    """Sleeping task.
+
+    Sleeping tasks can be ordered by resume time.
+    """
+
     task: Task = field(compare=False)
     resume_at: float
 
@@ -234,11 +239,39 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
     task_queue: list[tuple[Task, SendType]] = [(Task(main), None)]
 
     watched_by: defaultdict[Task, list[Task]] = defaultdict(list)
+
+    # heapq of sleeping tasks, orderd by increasing resume time
     sleeping_tasks: list[SleepingTask] = []
 
     while True:
         # FIXME: how long should we sleep depending on whether there is no pending task
         # and/or no sleeping task and/or no watched socket.
+
+        if not task_queue:
+            if not io_selector.get_map():
+                # If task_queue and io_selector and sleeping_tasks are empty,
+                # then there is nothing left to do!
+                if not sleeping_tasks:
+                    return
+
+                # If no task is pending and we are not watching any socket,
+                # sleep until the next sleeping task must be awoken.
+                delay = max(0, sleeping_tasks[0].resume_at - clock())
+                time.sleep(delay)
+
+            else:
+                timeout = (
+                    max(0, sleeping_tasks[0].resume_at - clock())
+                    if sleeping_tasks
+                    else None
+                )
+
+                for key, _ in io_selector.select(timeout):
+                    # Resume task
+                    task_queue.append((key.data, None))
+
+                    # Stop watching socket
+                    io_selector.unregister(key.fileobj)
 
         # If no task is pending and we are not watching any socket, don't loop
         timeout = max(0, sleeping_tasks[0].resume_at - clock())
