@@ -164,12 +164,10 @@ def nothing(id: str = "unknown") -> Generator[Nothing, None, None]:
     yield Nothing(id)
 
 
-@coroutine
-def socketpair() -> Generator[None, None, tuple[socket.socket, socket.socket]]:
+def socketpair() -> tuple[socket.socket, socket.socket]:
     lhs, rhs = socket.socketpair()
     lhs.setblocking(False)
     rhs.setblocking(False)
-    yield
     return lhs, rhs
 
 
@@ -189,29 +187,40 @@ async def hello_delayed(name: str, delay: timedelta):
 
 
 async def main():
+    left, right = socketpair()
+
     # Recover the child task handle.
     alice = await spawn(hello("Alice"))
 
-    # Dummy event loop steps
-    await nothing("main 1")
-    await nothing("main 2")
-    await nothing("main 3")
-    await nothing("main 4")
-    await nothing("main 5")
+    # Progress the event loop, for debugging
+    for i in range(10):
+        await nothing(f"main {i}")
+
+    # Send data on a socket in the background
+    await spawn(send(left, b"hello Shadowheart!! how are you doing???"))
+    received = await recv(right, 10)
+    print(f"Received (right): {received}")
+
+    # Send data the other way around
+    await spawn(send(right, b"hello nice to meet you :))"))
+    received = await recv(left, 10)
+    print(f"Received (left): {received}")
 
     # Test sleep
     start = clock()
     _ = await spawn(hello_delayed("Bob", timedelta(seconds=2)))
-    await sleep(timedelta(seconds=3))
+    delay = timedelta(seconds=5)
+    print(f"Sleeping for {delay.total_seconds()} s")
+    await sleep(delay)
     duration = clock() - start
     print(f"Slept for {duration} s")
 
     # Wait for the child task to complete.
     await join(alice)
-    print("after alice")
+    print("After alice")
 
     await hello("Carl")
-    print("after bob")
+    print("After bob")
 
 
 ## Async 'runtime' ------------------------------------------------------------
@@ -234,19 +243,16 @@ class SleepingTask:
 
 
 def run_until_complete(main: Coroutine[Any, Any, Any]):
-    io_selector = selectors.DefaultSelector()
-
+    # All currently running async functions
     task_queue: list[tuple[Task, SendType]] = [(Task(main), None)]
-
     watched_by: defaultdict[Task, list[Task]] = defaultdict(list)
 
     # heapq of sleeping tasks, orderd by increasing resume time
     sleeping_tasks: list[SleepingTask] = []
 
-    while True:
-        # FIXME: how long should we sleep depending on whether there is no pending task
-        # and/or no sleeping task and/or no watched socket.
+    io_selector = selectors.DefaultSelector()
 
+    while True:
         if not task_queue:
             if not io_selector.get_map():
                 # If task_queue and io_selector and sleeping_tasks are empty,
@@ -272,20 +278,6 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
 
                     # Stop watching socket
                     io_selector.unregister(key.fileobj)
-
-        # If no task is pending and we are not watching any socket, don't loop
-        timeout = max(0, sleeping_tasks[0].resume_at - clock())
-        if not task_queue and not io_selector.get_map():
-            time.sleep(timeout)
-
-        # If only no task are pending
-        elif not task_queue:
-            for key, _ in io_selector.select(timeout):
-                # Resume task
-                task_queue.append((key.data, None))
-
-                # Stop watching socket
-                io_selector.unregister(key.fileobj)
 
         # Schedule tasks that have their sleep delay elapsed
         while sleeping_tasks and sleeping_tasks[0].resume_at < clock():
