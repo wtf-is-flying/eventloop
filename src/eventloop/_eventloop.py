@@ -1,6 +1,4 @@
-# pyright: strict, reportUnknownMemberType=false
-"""
-Understanding the Magic Behind Await:
+"""Understanding the Magic Behind Await:
 ------------------------------------
 When you write "result = await coroutine_function()", Python actually desugars this into:
 
@@ -36,18 +34,18 @@ while True:
 
 from __future__ import annotations
 
-from collections import defaultdict
-from collections.abc import Generator, Coroutine
-from dataclasses import dataclass, field
-from datetime import timedelta
 import heapq
-from random import random
 import selectors
 import socket
 import time
+from collections import defaultdict
+from dataclasses import dataclass, field
 from types import coroutine
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+if TYPE_CHECKING:
+    from collections.abc import Coroutine, Generator
+    from datetime import timedelta
 
 # def clock() -> float: ...
 clock = time.time
@@ -102,7 +100,7 @@ class Join(EventLoopRequest):
 
 
 @coroutine
-def join(task: Task) -> Generator[Join, None, None]:
+def join(task: Task) -> Generator[Join]:
     """Wait for a task to complete."""
     # This yield back control to the event loop with a Join request.
     # The event loop will schedule back the parent task when the child task finishes.
@@ -115,7 +113,7 @@ class Sleep(EventLoopRequest):
 
 
 @coroutine
-def sleep(delay: timedelta) -> Generator[Sleep, None, None]:
+def sleep(delay: timedelta) -> Generator[Sleep]:
     """Sleep for the given delay."""
     yield Sleep(delay=delay)
 
@@ -127,7 +125,10 @@ class Receive(EventLoopRequest):
 
 @coroutine
 def recv(socket: socket.socket, size: int) -> Generator[Receive, None, bytes]:
-    """Receive data from a socket."""
+    """Receive data from a socket.
+
+    The socket should be non-blocking.
+    """
     # This yield will return when the socket is ready for read
     yield Receive(socket=socket)
 
@@ -141,8 +142,11 @@ class Send(EventLoopRequest):
 
 
 @coroutine
-def send(socket: socket.socket, data: bytes) -> Generator[Send, None, None]:
-    """Send data on a socket."""
+def send(socket: socket.socket, data: bytes) -> Generator[Send]:
+    """Send data on a socket.
+
+    The socket should be non-blocking.
+    """
     # Loop until all data is sent
     while data:
         # This yield will return when the socket is ready for write
@@ -155,73 +159,21 @@ def send(socket: socket.socket, data: bytes) -> Generator[Send, None, None]:
 
 
 @dataclass
-class Nothing(EventLoopRequest):
-    id: str
+class Nothing(EventLoopRequest): ...
 
 
 @coroutine
-def nothing(id: str = "unknown") -> Generator[Nothing, None, None]:
+def nothing() -> Generator[Nothing]:
     """Do nothing, much like an `await sleep(0)`."""
-    yield Nothing(id)
+    yield Nothing()
 
 
 def socketpair() -> tuple[socket.socket, socket.socket]:
+    """Get a pair of non-blocking sockets."""
     lhs, rhs = socket.socketpair()
     lhs.setblocking(False)
     rhs.setblocking(False)
     return lhs, rhs
-
-
-## Example functions ----------------------------------------------------------
-##   Some test functions to showcase how all of this works.
-## ----------------------------------------------------------------------------
-
-
-async def hello(name: str):
-    await nothing("hello")
-    print(f"Hello, {name}!")
-
-
-async def hello_delayed(name: str, delay: timedelta):
-    await sleep(delay)
-    print(f"H-H-H-Hello, {name}!")
-
-
-async def main():
-    left, right = socketpair()
-
-    # Recover the child task handle.
-    alice = await spawn(hello("Alice"))
-
-    # Progress the event loop, for debugging
-    for i in range(10):
-        await nothing(f"main {i}")
-
-    # Send data on a socket in the background
-    await spawn(send(left, b"hello Shadowheart!! how are you doing???"))
-    received = await recv(right, 10)
-    print(f"Received (right): {received}")
-
-    # Send data the other way around
-    await spawn(send(right, b"hello nice to meet you :))"))
-    received = await recv(left, 10)
-    print(f"Received (left): {received}")
-
-    # Test sleep
-    start = clock()
-    _ = await spawn(hello_delayed("Bob", timedelta(seconds=2)))
-    delay = timedelta(seconds=5)
-    print(f"Sleeping for {delay.total_seconds()} s")
-    await sleep(delay)
-    duration = clock() - start
-    print(f"Slept for {duration} s")
-
-    # Wait for the child task to complete.
-    await join(alice)
-    print("After alice")
-
-    await hello("Carl")
-    print("After bob")
 
 
 ## Async 'runtime' ------------------------------------------------------------
@@ -244,6 +196,7 @@ class SleepingTask:
 
 
 def run_until_complete(main: Coroutine[Any, Any, Any]):
+    """Run a coroutine until completion."""
     # All currently running async functions
     task_queue: list[tuple[Task, SendType]] = [(Task(main), None)]
     watched_by: defaultdict[Task, list[Task]] = defaultdict(list)
@@ -344,66 +297,3 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
 
         if not task_queue and not sleeping_tasks and not io_selector.get_map():
             break
-
-
-# -----------------------------------------------------------------------------
-# Echo Server
-# -----------------------------------------------------------------------------
-
-
-async def handle_client(client: socket.socket):
-    print("Client connected")
-
-    try:
-        while True:
-            data = await recv(client, 1024)
-
-            if not data:
-                break  # client closed connection
-
-            print(f"Received: {data!r}")
-            await handle_request(client, data)
-
-    finally:
-        print("Client disconnected")
-        client.close()
-
-
-async def handle_request(client: socket.socket, data: bytes):
-    await sleep(timedelta(seconds=random() * 10))
-    await send(client, b"echo " + data)
-
-
-async def accept_loop(server: socket.socket):
-    server.setblocking(False)
-
-    while True:
-        # Wait until server socket is readable (incoming connection)
-        await recv(server, 0)  # reuse Receive readiness primitive
-
-        try:
-            client, _ = server.accept()
-            client.setblocking(False)
-
-            # Spawn a handler task for this client
-            await spawn(handle_client(client))
-
-        except BlockingIOError:
-            # No connection ready (rare race)
-            pass
-
-
-async def echo_server(host="127.0.0.1", port=8888):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((host, port))
-    server.listen()
-    server.setblocking(False)
-
-    print(f"Echo server listening on {host}:{port}")
-
-    await accept_loop(server)
-
-
-if __name__ == "__main__":
-    run_until_complete(echo_server())
