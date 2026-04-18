@@ -29,7 +29,9 @@ async def accept_loop(server: socket.socket) -> None:
         await recv(server, 0)
 
         try:
-            client, _ = server.accept()
+            client, (addr, port) = server.accept()
+            print(f"Accepted connection from {addr}:{port}")
+
             client.setblocking(False)
 
             # Spawn a handler task for this client
@@ -41,8 +43,6 @@ async def accept_loop(server: socket.socket) -> None:
 
 
 async def handle_client(client: socket.socket) -> None:
-    print("Client connected")
-
     try:
         while True:
             data = await recv(client, 1024)
@@ -51,7 +51,7 @@ async def handle_client(client: socket.socket) -> None:
                 break  # client closed connection
 
             print(f"Received: {data!r}")
-            await handle_request(client, data)
+            await spawn(handle_request(client, data))
 
     finally:
         print("Client disconnected")
@@ -60,7 +60,7 @@ async def handle_client(client: socket.socket) -> None:
 
 async def handle_request(client: socket.socket, data: bytes) -> None:
     # Sleep to simulate busy work
-    await sleep(timedelta(seconds=random.random() * 10))
+    await sleep(timedelta(seconds=random.random() * 2))
 
     await send(client, b"echo " + data)
 

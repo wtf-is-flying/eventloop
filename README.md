@@ -2,7 +2,10 @@
 
 Pure Python tiny async runtime :slightly_smiling_face:
 
-I need to fix sockets!! :white_frowning_face:
+To do:
+
+- [ ] Don't have `spawn` be an async function.
+- [ ] Refactor printing into proper logging.
 
 Sources:
 

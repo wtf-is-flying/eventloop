@@ -38,6 +38,7 @@ import heapq
 import selectors
 import socket
 import time
+import typing
 from collections import defaultdict
 from dataclasses import dataclass, field
 from types import coroutine
@@ -89,6 +90,8 @@ def spawn(coroutine: Coroutine[Any, Any, Any]) -> Generator[Spawn, Task, Task]:
     """Spawn a coroutine in the background, returning a handle to it.
 
     The result can then be obtained using `join`.
+    This function is currently async because the only way to send events
+    to the event loop is via an async function.
     """
     handle = yield Spawn(coroutine=coroutine)
     return handle
@@ -125,10 +128,10 @@ class Receive(EventLoopRequest):
 
 @coroutine
 def recv(socket: socket.socket, size: int) -> Generator[Receive, None, bytes]:
-    """Receive data from a socket.
+    """Receive data from a socket."""
+    # Ensure that is socket is non-blocking.
+    socket.setblocking(False)
 
-    The socket should be non-blocking.
-    """
     # This yield will return when the socket is ready for read
     yield Receive(socket=socket)
 
@@ -143,10 +146,10 @@ class Send(EventLoopRequest):
 
 @coroutine
 def send(socket: socket.socket, data: bytes) -> Generator[Send]:
-    """Send data on a socket.
+    """Send data on a socket."""
+    # Ensure that is socket is non-blocking.
+    socket.setblocking(False)
 
-    The socket should be non-blocking.
-    """
     # Loop until all data is sent
     while data:
         # This yield will return when the socket is ready for write
@@ -195,6 +198,12 @@ class SleepingTask:
     resume_at: float
 
 
+@dataclass
+class SelectorData:
+    read: list[Task] = field(default_factory=list)
+    write: list[Task] = field(default_factory=list)
+
+
 def run_until_complete(main: Coroutine[Any, Any, Any]):
     """Run a coroutine until completion."""
     # All currently running async functions
@@ -226,12 +235,20 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
                     else None
                 )
 
-                for key, _ in io_selector.select(timeout):
-                    # Resume task
-                    task_queue.append((key.data, None))
+                for key, mask in io_selector.select(timeout):
+                    data = typing.cast(SelectorData, key.data)
 
-                    # Stop watching socket
-                    io_selector.unregister(key.fileobj)
+                    if mask & selectors.EVENT_READ:
+                        task_queue.extend((t, None) for t in data.read)
+                        data.read.clear()
+
+                    if mask & selectors.EVENT_WRITE:
+                        task_queue.extend((t, None) for t in data.write)
+                        data.write.clear()
+
+                    # Stop watching socket if there is no more pending task
+                    if not data.read and not data.write:
+                        io_selector.unregister(key.fileobj)
 
         # Schedule tasks that have their sleep delay elapsed
         while sleeping_tasks and sleeping_tasks[0].resume_at < clock():
@@ -286,10 +303,40 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
                         )
 
                     case Send(socket):
-                        io_selector.register(socket, selectors.EVENT_WRITE, task)
+                        try:
+                            key = io_selector.get_key(socket)
+                        except KeyError:
+                            io_selector.register(
+                                socket,
+                                selectors.EVENT_WRITE,
+                                SelectorData(write=[task]),
+                            )
+                        else:
+                            data = typing.cast(SelectorData, key.data)
+                            data.write.append(task)
+                            io_selector.modify(
+                                socket,
+                                key.events | selectors.EVENT_WRITE,
+                                data,
+                            )
 
                     case Receive(socket):
-                        io_selector.register(socket, selectors.EVENT_READ, task)
+                        try:
+                            key = io_selector.get_key(socket)
+                        except KeyError:
+                            io_selector.register(
+                                socket,
+                                selectors.EVENT_READ,
+                                SelectorData(read=[task]),
+                            )
+                        else:
+                            data = typing.cast(SelectorData, key.data)
+                            data.read.append(task)
+                            io_selector.modify(
+                                socket,
+                                key.events | selectors.EVENT_READ,
+                                data,
+                            )
 
                     case Nothing():
                         # Debug request; continue parent
