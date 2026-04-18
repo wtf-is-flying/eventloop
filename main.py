@@ -41,6 +41,7 @@ from collections.abc import Generator, Coroutine
 from dataclasses import dataclass, field
 from datetime import timedelta
 import heapq
+from random import random
 import selectors
 import socket
 import time
@@ -345,5 +346,64 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
             break
 
 
+# -----------------------------------------------------------------------------
+# Echo Server
+# -----------------------------------------------------------------------------
+
+
+async def handle_client(client: socket.socket):
+    print("Client connected")
+
+    try:
+        while True:
+            data = await recv(client, 1024)
+
+            if not data:
+                break  # client closed connection
+
+            print(f"Received: {data!r}")
+            await handle_request(client, data)
+
+    finally:
+        print("Client disconnected")
+        client.close()
+
+
+async def handle_request(client: socket.socket, data: bytes):
+    await sleep(timedelta(seconds=random() * 10))
+    await send(client, b"echo " + data)
+
+
+async def accept_loop(server: socket.socket):
+    server.setblocking(False)
+
+    while True:
+        # Wait until server socket is readable (incoming connection)
+        await recv(server, 0)  # reuse Receive readiness primitive
+
+        try:
+            client, _ = server.accept()
+            client.setblocking(False)
+
+            # Spawn a handler task for this client
+            await spawn(handle_client(client))
+
+        except BlockingIOError:
+            # No connection ready (rare race)
+            pass
+
+
+async def echo_server(host="127.0.0.1", port=8888):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((host, port))
+    server.listen()
+    server.setblocking(False)
+
+    print(f"Echo server listening on {host}:{port}")
+
+    await accept_loop(server)
+
+
 if __name__ == "__main__":
-    run_until_complete(main())
+    run_until_complete(echo_server())
