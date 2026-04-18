@@ -25,11 +25,23 @@ async def hello_delayed(name: str, delay: timedelta) -> None:
     print(f"H-H-H-Hello, {name}!")
 
 
+async def short_task() -> int:
+    await sleep(timedelta(milliseconds=12))
+    return 69
+
+
+async def long_task() -> int:
+    await sleep(timedelta(seconds=4))
+    return 420
+
+
 async def main() -> None:
     left, right = socketpair()
 
     # Recover the child task handle.
     alice = await spawn(hello("Alice"))
+
+    long_task_handle = await spawn(long_task())
 
     # Progress the event loop, for debugging
     for _ in range(10):
@@ -44,6 +56,9 @@ async def main() -> None:
     await spawn(send(right, b"hello nice to meet you :))"))
     received = await recv(left, 10)
     print(f"Received (left): {received}")
+
+    long_task_result = await join(long_task_handle)
+    print(f"Long task result: {long_task_result}")
 
     # Test sleep
     start = clock()
@@ -60,6 +75,13 @@ async def main() -> None:
 
     await hello("Carl")
     print("After bob")
+
+    # Test joining a task after it has finished
+    short_task_handle = await spawn(short_task())
+    await sleep(timedelta(seconds=1))
+
+    short_task_result = await join(short_task_handle)
+    print(f"short task result: {short_task_result}")
 
 
 if __name__ == "__main__":

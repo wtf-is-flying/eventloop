@@ -39,10 +39,12 @@ import selectors
 import socket
 import time
 import typing
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from types import coroutine
 from typing import TYPE_CHECKING, Any
+from uuid import UUID
 
 if TYPE_CHECKING:
     from collections.abc import Coroutine, Generator
@@ -63,21 +65,20 @@ class Finished:
     value: Any
 
 
-@dataclass
+@dataclass(kw_only=True)
 class Task:
+    id: UUID = field(default_factory=uuid.uuid4)
     coroutine: Coroutine[YieldType, Any, Any]
     state: Pending | Finished = field(default_factory=Pending)
 
 
-## EventLoopRequest -----------------------------------------------------------
-##   EventLoopRequest are types that are sent to the event loop.
-##   They are implementation details of the async runtime.
-##   They allow the runtime to know what to actually do.
-##   User of this 'library' would use the corresponding functions instead.
-## ----------------------------------------------------------------------------
+class EventLoopRequest:
+    """EventLoopRequest are types that are sent to the event loop.
 
-
-class EventLoopRequest: ...
+    They are implementation details of the async runtime.
+    They allow the runtime to know what to actually do.
+    User of this 'library' would use the corresponding functions instead.
+    """
 
 
 @dataclass
@@ -103,11 +104,12 @@ class Join(EventLoopRequest):
 
 
 @coroutine
-def join(task: Task) -> Generator[Join]:
+def join(task: Task) -> Generator[Join, Any, Any]:
     """Wait for a task to complete."""
     # This yield back control to the event loop with a Join request.
     # The event loop will schedule back the parent task when the child task finishes.
-    yield Join(task)
+    result = yield Join(task)
+    return result
 
 
 @dataclass
@@ -204,11 +206,14 @@ class SelectorData:
     write: list[Task] = field(default_factory=list)
 
 
-def run_until_complete(main: Coroutine[Any, Any, Any]):
-    """Run a coroutine until completion."""
+def run_until_complete(main: Coroutine[Any, Any, Any]) -> None:
+    """Run a coroutine until completion.
+
+    Think of it like `asyncio.run()`.
+    """
     # All currently running async functions
-    task_queue: list[tuple[Task, SendType]] = [(Task(main), None)]
-    watched_by: defaultdict[Task, list[Task]] = defaultdict(list)
+    task_queue: list[tuple[Task, SendType]] = [(Task(coroutine=main), None)]
+    watched_by: defaultdict[UUID, list[Task]] = defaultdict(list)
 
     # heapq of sleeping tasks, orderd by increasing resume time
     sleeping_tasks: list[SleepingTask] = []
@@ -269,12 +274,12 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
                 task.state = Finished(value=exc.value)
 
                 # Reschedule tasks waiting on this task
-                task_queue.extend((t, None) for t in watched_by.pop(task, []))
+                task_queue.extend((t, exc.value) for t in watched_by.pop(task.id, []))
 
             else:
                 match yielded:
                     case Spawn(coroutine):
-                        child = Task(coroutine)
+                        child = Task(coroutine=coroutine)
                         # Resume task which requested a spawn.
                         # It will send back `child` to the parent
                         # on the next iteration (insert at 0).
@@ -287,7 +292,7 @@ def run_until_complete(main: Coroutine[Any, Any, Any]):
                         match child.state:
                             case Pending():
                                 # Child task is currently in queue
-                                watched_by[child].append(task)
+                                watched_by[child.id].append(task)
                             case Finished(value):
                                 # Child task finished.
                                 # Resume the parent task immediately

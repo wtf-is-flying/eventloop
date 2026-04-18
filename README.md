@@ -5,6 +5,7 @@ Pure Python tiny async runtime :slightly_smiling_face:
 To do:
 
 - [ ] Don't have `spawn` be an async function.
+- [ ] Handle `main` return value.
 - [ ] Refactor printing into proper logging.
 
 Sources:
